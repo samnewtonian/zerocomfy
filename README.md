@@ -1,4 +1,4 @@
-# subnet-authority
+# zerocomfy
 
 A lightweight service discovery system for IPv6 ULA subnets. Bridges mDNS/DNS-SD to devices that can't participate in it (embedded systems, tunneled remote clients).
 
@@ -121,7 +121,7 @@ Runtime daemon that:
 ## Project Structure
 
 ```
-subnet-authority/
+zerocomfy/
 ├── Cargo.toml                 # Workspace root
 ├── shared/                    # Shared types library
 ├── subnet-authorityd/         # Authority daemon (Rust)
