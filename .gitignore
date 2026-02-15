@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+target/
+resources/public/js/
+out/
+.shadow-cljs/
+
+# Editor/IDE
+.idea/
+.nova/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# REPL history
+.nrepl-port
+.cpcache/
+
+# Language servers
+.clj-kondo/
+.lsp/
+
+# Dev server
+.shadow-cljs.pid
+
+# Caddy
+Caddyfile

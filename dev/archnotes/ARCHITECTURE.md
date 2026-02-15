@@ -1,0 +1,481 @@
+# Subnet Authority — Architecture & Goals
+
+## Overview
+
+This project provides a self-configuring IPv6 ULA subnet with centralized service discovery. It is split into three segments:
+
+1. **`subnet-config`** — A utility that reads a small declarative configuration and generates the appropriate config files for system daemons (`radvd`, `systemd-networkd`, `dnsmasq`, etc.) that make a machine act as the subnet authority. This is not a daemon itself — it is a one-shot (or watch-mode) tool that translates project-level intent into platform-native configuration.
+
+2. **`subnet-authorityd`** / **`subnet-client`** — The authority daemon and its optional client agent. The daemon continuously browses mDNS, maintains a service cache, and exposes it via REST, CoAP, and DNS interfaces. The client agent runs on workstations and servers for richer, faster authority-aware service discovery.
+
+3. **`ban-gateway`** *(future)* — A separate project that bridges BLE wearables and implants to the subnet through per-person gateway nodes. Out of scope for initial implementation; documented in the Future Work section.
+
+The authority is **not** the source of truth for services. The source of truth is the network itself: nodes advertise services via mDNS, and the authority passively browses and caches those advertisements. This is a hybrid model — full zeroconf for capable devices, with a centralized fallback for constrained ones.
+
+## Problem Statement
+
+mDNS/DNS-SD works well for service discovery on a local link, but has practical limitations:
+
+- **Cold query latency**: querying a `.local` name that hasn't been recently resolved incurs noticeable delay while mDNS probes the network.
+- **No cross-link reach**: mDNS is multicast and link-local. Devices tunneling in via WireGuard or similar cannot participate in mDNS unless the tunnel bridges multicast, which is fragile.
+- **Constrained devices**: small embedded targets (ESP32, microcontrollers) may not have the resources or software stack to run a full mDNS/DNS-SD implementation.
+- **No persistent state**: mDNS caches are ephemeral and per-host. There is no shared, queryable record of what services exist on the network.
+
+The authority solves these by maintaining a warm, always-up-to-date cache of all mDNS-advertised services and exposing that cache through multiple lightweight interfaces.
+
+## Target Environment
+
+- **Scale**: single digits to low dozens of nodes.
+- **Network**: single IPv6 ULA /64 prefix on one link (ethernet/WiFi), plus remote nodes tunneling in.
+- **Node types**: Linux servers, Linux/macOS workstations, embedded devices (ESP32 and similar), mobile devices (via tunnel).
+- **Deployment**: home lab and personal network. Not designed for enterprise or multi-site federation.
+
+---
+
+## Segment 1: `subnet-config`
+
+### Purpose
+
+Setting up a machine as the subnet authority requires configuring several system daemons: `radvd` for Router Advertisements, `systemd-networkd` for the static `::1` address on the prefix, optionally `dnsmasq` for DNS forwarding, and potentially WireGuard for tunnel endpoints. These are all standard tools with their own config file formats.
+
+`subnet-config` is a utility that reads a single, small, declarative project config file and generates the appropriate native config files for each of these daemons. The user describes *what* they want (prefix, interface, zone name, tunnel peers) and the tool produces *how* to achieve it in platform-native terms.
+
+### Input Configuration
+
+A single TOML file describes the desired subnet state:
+
+```toml
+[authority]
+interface = "eth0"
+prefix = "fdXX:XXXX:XXXX:1::/64"
+address = "fdXX:XXXX:XXXX:1::1/64"        # static address for the authority
+zone = "subnet.example"                     # DNS zone name (not .local)
+
+[radvd]
+# RA settings — translated into /etc/radvd.conf
+adv_autonomous = true                       # SLAAC
+adv_managed = false                         # no DHCPv6 for addresses
+adv_other = false
+rdnss = true                                # advertise authority as DNS
+
+[dns]
+# If using dnsmasq or systemd-resolved as a local forwarder
+upstream = ["1.1.1.1", "9.9.9.9"]          # upstream DNS for non-zone queries
+
+[wireguard]
+enabled = false
+# config_path = "/etc/wireguard/wg-subnet.conf"
+# peers = [...]
+
+# Optional: additional systemd-networkd settings
+[networkd]
+# Extra .network or .netdev units to generate
+```
+
+### Output Artifacts
+
+`subnet-config` reads the input and produces:
+
+| Input section | Output file | Daemon |
+|---|---|---|
+| `[authority]` + `[radvd]` | `/etc/radvd.conf` | `radvd` |
+| `[authority]` | `/etc/systemd/network/50-subnet-authority.network` | `systemd-networkd` |
+| `[authority]` + `[dns]` | `/etc/dnsmasq.d/subnet-authority.conf` (if applicable) | `dnsmasq` |
+| `[wireguard]` | `/etc/wireguard/wg-subnet.conf` | `wg-quick` / `systemd-networkd` |
+
+Example generated `radvd.conf`:
+
+```
+# Generated by subnet-config — do not edit manually
+interface eth0 {
+    AdvSendAdvert on;
+    AdvManagedFlag off;
+    AdvOtherConfigFlag off;
+    prefix fdXX:XXXX:XXXX:1::/64 {
+        AdvOnLink on;
+        AdvAutonomous on;
+    };
+    RDNSS fdXX:XXXX:XXXX:1::1 { };
+};
+```
+
+Example generated systemd-networkd unit:
+
+```ini
+# Generated by subnet-config — do not edit manually
+[Match]
+Name=eth0
+
+[Network]
+Address=fdXX:XXXX:XXXX:1::1/64
+IPv6AcceptRA=false
+
+[IPv6AcceptRA]
+UseAutonomousPrefix=false
+```
+
+### Modes of Operation
+
+- **One-shot** (`subnet-config generate`): read config, write output files, exit. Suitable for running once during setup or from a provisioning script.
+- **Check** (`subnet-config check`): validate the input config, diff the output against existing files, report what would change. Does not write anything.
+- **Apply** (`subnet-config apply`): generate files and restart/reload the affected daemons (`systemctl restart radvd`, etc.). Convenience wrapper around generate + service management.
+
+### Why a Separate Utility?
+
+Embedding radvd/networkd/dnsmasq configuration into the authority daemon would conflate two concerns: system-level network setup (which happens once and changes rarely) and runtime service discovery (which runs continuously). Keeping them separate means:
+
+- The authority daemon doesn't need root privileges for network configuration — it only needs them at startup for binding to privileged ports (53, 5683), which can be granted via capabilities.
+- The config generator can be run independently during initial machine setup, in a Packer/Ansible pipeline, or on a fresh install, without the daemon running.
+- Each generated config file is a standard, auditable, native config that can be inspected, version-controlled, and edited by hand if needed.
+- The daemon doesn't need to understand or manage the lifecycle of radvd, networkd, or dnsmasq.
+
+---
+
+## Segment 2: Authority Daemon & Client Agent
+
+### 2.1 mDNS Browsing and Caching (`subnet-authorityd`)
+
+The authority continuously browses the local link for all DNS-SD service types and maintains a local cache of discovered services.
+
+**Browse strategy:**
+
+- Subscribe to `_services._dns-sd._udp.local` to enumerate all service types present on the network.
+- For each discovered service type, browse for individual instances.
+- Resolve each instance to get host, addresses (AAAA), port, and TXT records.
+- Honor mDNS TTLs and goodbye packets for cache invalidation.
+- Periodically re-probe entries that haven't been refreshed, to keep the cache warm and eliminate cold-query latency for API consumers.
+
+**Cache schema (per entry):**
+
+```
+service_type:    "_http._tcp"
+instance_name:   "fileserver._http._tcp.local"
+hostname:        "nas.local"
+addresses:       ["fdXX:...:YYYY"]
+port:            8080
+txt:             {"path": "/files", "version": "2.1"}
+first_seen:      <timestamp>
+last_seen:       <timestamp>
+ttl:             4500
+alive:           true
+```
+
+**Storage:** local SQLite database in WAL mode. This gives crash recovery, queryability, and zero external dependencies. The dataset is small (dozens to hundreds of entries) so SQLite is more than sufficient.
+
+**Self-advertisement:** The authority advertises itself via mDNS as a `_subnet-authority._tcp.local` service. The TXT record includes the DNS zone name, API port, CoAP port, and DNS port. This allows client agents and other authority-aware software to discover the authority and its configuration without any preconfigured knowledge.
+
+```
+_subnet-authority._tcp.local.
+  host: authority.local
+  port: 8053
+  txt: zone=subnet.example, prefix=fdXX:XXXX:XXXX:1::/64, coap=5683, dns=53
+```
+
+**Cache hashing:** maintain a hash (e.g. SHA-256) of the serialized service list. Clients can cheaply check whether their local copy is stale by comparing hashes before pulling the full list.
+
+### 2.2 Service API
+
+Expose the cached service list through multiple interfaces to accommodate different client capabilities.
+
+**REST/HTTP API** — for general-purpose clients and tooling:
+
+```
+GET /v1/config                      → authority metadata (zone name, prefix, ports)
+GET /v1/services                    → full service list (JSON)
+GET /v1/services?type=_http._tcp    → filtered by service type
+GET /v1/services/{instance}         → single service detail
+GET /v1/services/hash               → current cache hash (ETag)
+```
+
+The `/v1/config` endpoint is the bootstrapping entry point. A client that knows the authority's address (via well-known `::1` or mDNS discovery) can call this to learn the DNS zone, available interfaces, and other metadata needed to configure itself.
+
+Clients poll by checking the hash endpoint first. If the hash differs from their local copy, they pull the full list or a filtered subset.
+
+**CoAP** — for constrained embedded clients (ESP32, microcontrollers):
+
+- Same resource structure as HTTP but over UDP.
+- Support CoAP Observe for push-on-change, eliminating polling entirely.
+- Consider CBOR or MessagePack payloads for bandwidth-constrained devices.
+
+**DNS** — for maximum transparency:
+
+- Serve a DNS zone derived from the mDNS cache under a **separate, configurable zone name** (e.g. `subnet.example`). The `.local` TLD is not mirrored — see "DNS Zone Design" below for rationale.
+- `nas.local` in mDNS becomes `nas.subnet.example` in the authority's DNS zone.
+- Include AAAA records for addresses and SRV records for services with port information.
+- Client agents configure their local resolver to forward the authority's zone to the authority's DNS server. Non-agent devices can point DNS at the authority manually or via RDNSS in RA.
+- This is the lowest-friction option since DNS clients are ubiquitous across all platforms and languages.
+
+### 2.3 DNS Zone Design
+
+The authority serves its own DNS zone — it does **not** mirror `.local`. The `.local` TLD belongs to mDNS and is handled by avahi/Bonjour on each host. Conflating the two creates ambiguity about which resolver handles a query and risks breaking mDNS behavior.
+
+The authority's zone is a separate namespace. The zone name is configurable (e.g. `subnet.example`, `lab.home`, `net.internal`) and is advertised in the authority's mDNS service TXT records so clients can discover it automatically.
+
+**Name mapping:** when the authority sees `nas.local` in mDNS, it serves it as `nas.<zone>` in its DNS zone. The `.local` suffix is stripped and replaced with the configured zone. SRV records, AAAA records, and TXT records are all translated.
+
+**Who uses which namespace:**
+
+| Client type | Resolves via | Namespace |
+|---|---|---|
+| Workstation with avahi only | mDNS directly | `nas.local` |
+| Workstation with client agent | Local resolver → authority DNS | `nas.subnet.example` |
+| Workstation with both | Either works; agent path is faster | Both |
+| Tunneled remote device | Authority DNS (only option) | `nas.subnet.example` |
+| Constrained embedded device | Authority REST/CoAP API | JSON/CBOR (no DNS name needed) |
+| Device with DNS but no mDNS | Authority DNS | `nas.subnet.example` |
+
+### 2.4 Tunnel / Remote Access Support
+
+Devices not on the local link (mobile, remote embedded, off-site workstations) connect via WireGuard tunnel and reach the authority at its well-known `prefix::1` address.
+
+- Each remote device gets an address within the ULA prefix (or a separate routed /64).
+- The authority's API is reachable through the tunnel like any other on-link service.
+- Remote devices that can't do mDNS use the REST, CoAP, or DNS interface to discover services.
+
+**Authentication for remote/embedded devices:**
+
+- WireGuard keys (Curve25519) handle transport security and device identity.
+- For the API layer: mTLS with per-device client certificates, or a PSK scheme, or Ed25519-signed request nonces for very constrained devices.
+- The daemon config specifies allowed source prefixes for API access.
+
+### 2.5 Failover
+
+Given the home-lab scale and the authority's role as a cache (not source of truth), failover is simple:
+
+- A second node runs the same daemon in standby mode: browsing mDNS independently, building its own cache, but not advertising RA or serving the API.
+- The standby monitors `prefix::1` via periodic health checks.
+- If `::1` becomes unreachable, the standby assigns itself `::1` (gratuitous neighbor advertisement), starts radvd, and begins serving the API.
+- When the primary returns, it reclaims `::1` and the standby steps down.
+
+Both nodes independently watch mDNS, so their caches will be nearly identical. No replication protocol is needed. The only coordination is "who holds `::1`" — a simple VRRP-like pattern.
+
+Note: the failover node also needs the system daemon configs that `subnet-config` generates. Running `subnet-config` on the standby with the same input (but with appropriate failover settings) prepares it to take over if needed.
+
+### 2.6 Client Agent (`subnet-client`)
+
+Devices like printers and appliances that only advertise services need nothing beyond avahi — they participate in the network passively and the authority discovers them automatically. But workstations, servers, and other capable devices benefit from being **authority-aware**: they can query the authority directly for a richer, more immediate view of the network than mDNS alone provides.
+
+The client agent is a small daemon that runs on capable nodes. Its responsibilities:
+
+**Authority discovery:** On startup, the agent needs to find the authority and learn its configuration — specifically the DNS zone it serves. Options for bootstrapping:
+
+- **mDNS service browse**: the authority advertises itself as `_subnet-authority._tcp.local` with TXT records containing the zone name, API port, and other metadata. The client agent browses for this service type on startup. Self-describing, no preconfigured knowledge needed beyond "look for `_subnet-authority._tcp`".
+- **Well-known address convention**: the authority is always at `prefix::1`. If the client knows its own ULA prefix (from SLAAC), it can derive the authority address and call `GET /v1/config` to learn the rest.
+- **Both**: use mDNS discovery as primary, fall back to well-known `::1` if the browse times out.
+
+**Service list synchronization:** The agent periodically polls the authority's `/v1/services/hash` endpoint. If the hash has changed, it pulls the updated service list. This gives the client a complete, always-current view of the network without waiting for mDNS queries to resolve.
+
+**Local DNS configuration:** Once the agent knows the authority's DNS zone (e.g. `subnet.example`), it configures the local resolver to forward queries for that zone to the authority's DNS server:
+
+```bash
+# systemd-resolved (Arch Linux)
+resolvectl dns eth0 fdXX:XXXX:XXXX:1::1
+resolvectl domain eth0 ~subnet.example
+
+# macOS /etc/resolver/subnet.example
+nameserver fdXX:XXXX:XXXX:1::1
+```
+
+This way, any application on the workstation can resolve `nas.subnet.example` transparently — no mDNS, no `.local`, and no manual `/etc/hosts` entries.
+
+**Local cache:** The agent maintains its own local copy of the service list (in-memory or a small SQLite DB). Applications on the workstation can query the agent directly via a local socket or D-Bus interface for richer data than DNS provides — port numbers, TXT metadata, health status, service type filtering. This is the "more direct view" that authority-aware clients get.
+
+**Service registration shortcut:** While nodes should still advertise services via avahi for compatibility with non-authority-aware devices, the agent could also register services directly with the authority's API. This provides faster propagation (immediate, rather than waiting for the authority's mDNS browse cycle) and allows attaching metadata that doesn't fit neatly into DNS-SD TXT records.
+
+The client agent is **optional**. The network works without it — mDNS still works, the authority still caches, constrained devices still query the API. The agent just makes capable devices first-class participants with faster, richer access to the service directory.
+
+**Zone discovery for non-agent devices:** Tunneled-in devices or minimal clients that don't run the full client agent need to know the zone name. Options:
+
+- Preconfigure it as part of the WireGuard/VPN provisioning (the same step that provides the tunnel endpoint and keys also provides the DNS zone and authority address).
+- Query the authority's REST API at the well-known address: `GET /v1/config` returns the zone name, available interfaces, and other metadata.
+- Use the RDNSS option in Router Advertisements to point DNS at the authority, combined with a well-known DNS query (e.g. `_authority.subnet.example TXT`) that returns zone metadata.
+
+### Daemon Configuration
+
+The authority daemon reads its own runtime config, separate from `subnet-config`'s input. This config covers the daemon's behavior, not the system-level network setup:
+
+```toml
+[cache]
+db_path = "/var/lib/subnet-authority/services.db"
+browse_interval_secs = 30
+stale_after_secs = 300
+prune_after_secs = 3600
+
+[api]
+listen = "[::]:8053"
+allowed_prefixes = ["fdXX:XXXX:XXXX:1::/64"]
+
+[api.auth]
+enabled = true
+method = "mtls"  # or "psk", "ed25519"
+ca_cert = "/etc/subnet-authority/ca.pem"
+
+[dns]
+enabled = true
+listen = "[::]:53"
+zone = "subnet.example"  # must match what subnet-config advertises in RDNSS/RA
+
+[coap]
+enabled = true
+listen = "[::]:5683"
+
+[identity]
+# Used for self-advertisement and failover coordination
+prefix = "fdXX:XXXX:XXXX:1::/64"
+
+[failover]
+enabled = false
+priority = 1
+peer = "fdXX:XXXX:XXXX:1::2"
+health_interval_secs = 5
+miss_threshold = 3
+```
+
+### Client Agent Configuration
+
+```toml
+# /etc/subnet-authority/client.toml
+
+# Explicit authority address. If omitted, the agent discovers
+# the authority via mDNS (_subnet-authority._tcp) or derives
+# it from the local ULA prefix.
+# authority = "fdXX:XXXX:XXXX:1::1"
+
+[resolver]
+# Automatically configure the local DNS resolver to forward
+# the authority's zone to the authority's DNS server.
+configure_dns = true
+
+[cache]
+# Keep a local copy of the service list for fast lookups.
+enabled = true
+# sync_interval_secs = 30
+```
+
+---
+
+## Segment 3: BLE / Body Area Network Gateway *(Future)*
+
+A separate project (`ban-gateway`) that bridges BLE wearables and implants to the subnet by proxying their data as standard network services. Each person's gateway node connects to their BLE devices and advertises proxy services via avahi (and optionally registers directly with the authority).
+
+This introduces concerns distinct from the authority: per-person device ownership, BLE connection management and reconnection, GATT characteristic translation, data stream aggregation and buffering, and BLE-level security. It builds on top of the authority's service discovery infrastructure but is its own daemon with its own config and lifecycle.
+
+Out of scope for initial implementation. See earlier design discussions for detailed architecture notes.
+
+---
+
+## Language and Dependencies
+
+**Language:** Rust. Chosen for:
+
+- Single static binaries with no runtime dependencies — simple deployment.
+- Cross-compilation to embedded targets (ARM, RISC-V) if a lightweight client agent is ever needed on constrained nodes.
+- Strong ecosystem for the required components.
+
+**Key crates:**
+
+| Concern | Crate | Notes |
+|---|---|---|
+| mDNS browsing | `mdns-sd` | Pure Rust, no avahi dependency, both querier and responder. Thread-based daemon with channel API. |
+| HTTP API | `axum` or `tiny_http` | `axum` if async is acceptable, `tiny_http` for minimal dependencies. |
+| CoAP | `coap-lite` or `coap-rs` | UDP-based, suitable for constrained clients. |
+| DNS server | `hickory-dns` (formerly trust-dns) | Rust DNS server library, can serve custom zones. |
+| SQLite | `rusqlite` | Mature SQLite bindings, WAL mode support. |
+| Config | `toml` + `serde` | Standard Rust config parsing. |
+| TLS/crypto | `rustls` + `ring` | For mTLS and Ed25519 operations. |
+| Logging | `tracing` | Structured logging with subscriber ecosystem. |
+| D-Bus (client agent) | `zbus` | For interfacing with systemd-resolved on Linux. |
+
+## Project Structure
+
+```
+subnet-authority/
+├── Cargo.toml                       # Workspace root
+├── subnet-config/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                  # CLI: generate / check / apply
+│       ├── config.rs                # Parse the declarative input TOML
+│       ├── generators/
+│       │   ├── mod.rs
+│       │   ├── radvd.rs             # Generate radvd.conf
+│       │   ├── networkd.rs          # Generate systemd-networkd units
+│       │   ├── dnsmasq.rs           # Generate dnsmasq drop-in (optional)
+│       │   └── wireguard.rs         # Generate WireGuard config (optional)
+│       └── services.rs              # systemctl restart/reload helpers
+├── subnet-authorityd/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                  # Daemon entry point, signal handling
+│       ├── config.rs                # Daemon runtime config
+│       ├── mdns/
+│       │   ├── mod.rs
+│       │   ├── browser.rs           # Continuous mDNS browse, event handling
+│       │   ├── advertise.rs         # Self-advertisement via mDNS
+│       │   └── types.rs             # ServiceEntry, ServiceType, etc.
+│       ├── cache/
+│       │   ├── mod.rs
+│       │   ├── db.rs                # SQLite schema, read/write operations
+│       │   └── hash.rs              # Service list hashing for change detection
+│       ├── api/
+│       │   ├── mod.rs
+│       │   ├── http.rs              # REST endpoints
+│       │   ├── coap.rs              # CoAP resource handlers
+│       │   ├── dns.rs               # DNS zone serving from cache
+│       │   └── auth.rs              # mTLS / PSK / Ed25519 validation
+│       ├── zone/
+│       │   ├── mod.rs
+│       │   └── translate.rs         # .local → zone name mapping
+│       └── failover/
+│           ├── mod.rs
+│           └── health.rs            # Peer health checking, VIP takeover
+├── subnet-client/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                  # Client agent entry point
+│       ├── config.rs                # Client agent config
+│       ├── discover.rs              # Authority discovery (mDNS / well-known addr)
+│       ├── sync.rs                  # Hash-check + service list pull
+│       └── resolver.rs              # Local DNS resolver configuration
+├── shared/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── types.rs                 # ServiceEntry, AuthorityConfig — shared types
+│       └── protocol.rs              # API paths, TXT record schema constants
+├── systemd/
+│   ├── subnet-authorityd.service
+│   └── subnet-client.service
+├── examples/
+│   ├── subnet-config.toml           # Example input for subnet-config
+│   ├── authorityd.toml              # Example daemon config
+│   └── client.toml                  # Example client agent config
+└── tests/
+    ├── integration/
+    └── fixtures/
+```
+
+The workspace produces three binaries:
+
+- **`subnet-config`** — the setup utility. Reads declarative config, generates system daemon configs.
+- **`subnet-authorityd`** — the authority daemon. Browses mDNS, maintains the cache, serves the API.
+- **`subnet-client`** — the client agent. Discovers the authority, syncs the service list, configures the local DNS resolver.
+
+And a shared library crate (`shared/`) for types and constants used by all three.
+
+## Design Principles
+
+1. **Separate setup from runtime.** `subnet-config` handles one-time system configuration. `subnet-authorityd` handles continuous service discovery. They share a conceptual model but have different lifecycles, privilege requirements, and failure modes.
+2. **Lean on existing standards.** SLAAC for addressing, mDNS/DNS-SD for service advertisement, DNS for resolution. The authority adds value by caching and bridging, not by replacing. `subnet-config` generates config for established daemons rather than reimplementing their functionality.
+3. **Three tiers of participation.** Passive devices (printers, appliances) just advertise via avahi and need nothing else. Authority-aware devices (workstations, servers) run the client agent for richer, faster access. Constrained devices (embedded, tunneled) use the REST/CoAP/DNS API. All three tiers coexist on the same network.
+4. **Own namespace, don't pollute `.local`.** The authority serves a separate DNS zone. The `.local` TLD belongs to mDNS. Clients learn the authority's zone via mDNS service discovery or the REST API.
+5. **Auto-discover everything possible.** The client agent discovers the authority via mDNS, learns the zone name from TXT records, and configures the local resolver automatically. Manual config is available but shouldn't be needed on-link.
+6. **Generated config is auditable.** Every file `subnet-config` produces is a standard, readable, native config file. It can be version-controlled, hand-edited, or replaced entirely. The tool adds convenience, not lock-in.
+7. **Simplicity over completeness.** This is a home-lab tool. Prefer simple, correct implementations over feature-complete ones. No consensus protocols, no complex replication, no multi-site federation.
+
+## Future Work (Out of Scope for Initial Implementation)
+
+- **BLE / Body Area Network gateway** (Segment 3): see above.
+- **Web dashboard**: a UI for browsing discovered services, viewing health status, and managing configuration.
+- **Service health checking**: active probing of discovered services beyond what mDNS TTLs provide.
+- **Multi-prefix / multi-link support**: extending the authority to bridge services across multiple network segments.

@@ -1,0 +1,16 @@
+# subnet-authorityd example configuration
+
+[authority]
+interface = "eth0"
+prefix = "fd00:1234:5678:1::/64"
+address = "fd00:1234:5678:1::1/64"
+zone = "subnet.example"
+
+[cache]
+db_path = "/var/lib/subnet-authority/services.db"
+stale_after_secs = 300
+prune_after_secs = 3600
+maintenance_interval_secs = 60
+
+[api]
+listen = "[::]:8053"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Subnet Authority Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/subnet-authorityd /etc/subnet-authority/authorityd.toml
+Restart=on-failure
+RestartSec=5
+StateDirectory=subnet-authority
+
+[Install]
+WantedBy=multi-user.target
