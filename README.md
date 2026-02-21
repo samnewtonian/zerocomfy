@@ -2,6 +2,8 @@
 
 A lightweight service discovery system for IPv6 ULA subnets. Bridges mDNS/DNS-SD to devices that can't participate in it (embedded systems, tunneled remote clients).
 
+**IMPORTANT**: This is an experimental prototype codebase written by Claude Code, not yet ready for use.
+
 ## Status
 
 **In development** — MVP implementation complete:
